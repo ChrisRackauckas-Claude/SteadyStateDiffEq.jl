@@ -161,11 +161,9 @@ function __without_verbose(kwargs)
     return (; (name => value for (name, value) in pairs(kwargs) if name !== :verbose)...)
 end
 
-# Shared `DynamicSS` setup for `__solve` and `__init`: builds the ODE problem that
-# integrates `prob`'s residual to steady state, along with the termination
-# callback that stops the integration (and, for `__solve`, reports convergence).
-# Returns `nothing` for an SCC lowering, which has no single ODE trajectory to
-# build — callers fall back to `__solve_scc_lowering` for that case instead.
+# Shared `DynamicSS` setup for `__solve` and `__init`: the ODE problem integrating
+# `prob`'s residual to steady state and its termination callback. SCC lowerings are
+# handled by `__solve_scc_lowering` before this is reached.
 function __dynamicss_ode_setup(
         prob::SciMLBase.AbstractSteadyStateProblem, alg::DynamicSS;
         abstol, reltol, odesolve_kwargs, termination_condition, alias, kwargs...
@@ -255,14 +253,9 @@ function SciMLBase.__solve(
     )
 end
 
-# `init` on a `DynamicSS`-lowered problem hands back the underlying ODE
-# integrator (with the steady-state termination callback installed) rather than
-# eagerly integrating to steady state, so it composes with `solve!`/`step!` the
-# way `init`/`solve!` do for a plain `ODEProblem`. An `SCCNonlinearProblem`
-# lowering has no such continuous trajectory — its blocks solve sequentially, not
-# through one shared integrator — so there is nothing to "start and pause": it is
-# solved eagerly here, exactly as `__solve` does, and the finished solution is
-# returned instead of an integrator.
+# `init` returns the ODE integrator with the steady-state termination callback
+# installed. An SCC lowering solves its blocks sequentially with no single
+# integrator, so it is solved eagerly and the finished solution is returned.
 function SciMLBase.__init(
         prob::SciMLBase.AbstractSteadyStateProblem, alg::DynamicSS,
         args...; abstol = 1.0e-8, reltol = 1.0e-6, odesolve_kwargs = (;),
@@ -281,7 +274,7 @@ function SciMLBase.__init(
     return init(
         setup.odeprob, alg.alg, args...; setup.abstol, setup.reltol,
         setup.run_kwargs..., odesolve_kwargs..., setup.callback, save_end = true,
-        alias = setup.odealias
+        alias = setup.odealias, save_idxs
     )
 end
 
@@ -316,8 +309,7 @@ end
 
 # Shared `SICNM` setup for `__solve` and `__init`: builds the extended DAE ODE
 # problem whose continuous-Newton flow drives `g(y) = 0`, along with the
-# termination callback based on the residual `g`. Mirrors `__dynamicss_ode_setup`
-# above; see its docstring for why an SCC lowering is not handled here.
+# termination callback based on the residual `g`. Mirrors `__dynamicss_ode_setup`.
 function __sicnm_ode_setup(
         prob::SciMLBase.AbstractSteadyStateProblem, alg::SICNM;
         abstol, reltol, odesolve_kwargs, termination_condition, kwargs...
@@ -472,8 +464,7 @@ function SciMLBase.__solve(
     )
 end
 
-# See the analogous `DynamicSS` `__init` above for why an SCC lowering is solved
-# eagerly here rather than returning a partial integrator.
+# As for `DynamicSS`, an SCC lowering is solved eagerly.
 function SciMLBase.__init(
         prob::SciMLBase.AbstractSteadyStateProblem, alg::SICNM,
         args...; abstol = 1.0e-8, reltol = 1.0e-6, odesolve_kwargs = (;),
@@ -493,7 +484,7 @@ function SciMLBase.__init(
     return init(
         setup.odeprob, alg.alg, args...; abstol = setup.ode_abstol,
         reltol = setup.ode_reltol, setup.run_kwargs..., odesolve_kwargs...,
-        setup.callback, save_end = true
+        setup.callback, save_end = true, save_idxs
     )
 end
 

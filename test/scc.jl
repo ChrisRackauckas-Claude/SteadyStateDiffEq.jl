@@ -436,14 +436,9 @@ end
     @test sol.original isa Tuple{SciMLBase.LinearSolution, NonlinearSolution}
 end
 
-# `init` had no `DynamicSS`/`SICNM`-specific dispatch for `AbstractSteadyStateProblem`,
-# so it fell through to NonlinearSolve's "no algorithm" default-conversion path,
-# which cannot handle an `SCCNonlinearProblem` lowering (`SciMLBase.NonlinearProblem`
-# raises an `ArgumentError` for it). The `__init` methods below are more specific
-# than that default path, so it is never reached: on a plain problem `init` returns
-# a live ODE integrator, and on an SCC lowering — which has no single integrator to
-# hand back — it eagerly solves and returns the finished solution (see
-# `SciMLBase.__init` in src/solve.jl).
+# `init` with `DynamicSS`/`SICNM` uses these algorithms rather than NonlinearSolve's
+# default: a plain problem gives a live ODE integrator, an SCC lowering is solved
+# eagerly and returns the finished solution.
 @testset "init on DynamicSS/SICNM does not fall through to NonlinearSolve's default" begin
     @testset "plain SteadyStateProblem returns a live integrator" for alg in (
             DynamicSS(Tsit5()), SICNM(Rodas5P()),
@@ -455,6 +450,11 @@ end
         # `SICNM`'s integrator carries the extended DAE state `[y; z]`, so only
         # the first `length(prob.u0)` components are the original residual state.
         @test sol.u[end][1:1] ≈ [1.0] atol = 1.0e-6
+
+        prob2 = SteadyStateProblem((u, p, t) -> [1, 2] .- u, [0.0, 0.0])
+        sol2 = solve!(init(prob2, alg; save_idxs = [2], abstol = 1.0e-10, reltol = 1.0e-10))
+        @test length(sol2.u[end]) == 1
+        @test sol2.u[end] ≈ [2.0] atol = 1.0e-6
     end
 
     @testset "manually-built SCC lowering, alg=$alg" for alg in (
