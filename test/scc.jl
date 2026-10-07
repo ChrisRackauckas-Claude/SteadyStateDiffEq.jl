@@ -2,6 +2,7 @@ using SteadyStateDiffEq, NonlinearSolve, OrdinaryDiffEq, Test
 using ModelingToolkit
 using ModelingToolkit: t_nounits as t, D_nounits as D
 using SCCNonlinearSolve: SCCAlg
+using SymbolicIndexingInterface: getsym, variable_index
 using SciMLBase: HomotopyProblem, LinearProblem, NonlinearProblem, SCCNonlinearProblem,
     SteadyStateSolution
 
@@ -392,13 +393,14 @@ end
     @test prob.lowered_problem !== nothing
 
     # The `SSRootfind` solve happens on the `SCCNonlinearProblem` lowering, and
-    # `sol` is expressed on it.
+    # `sol` is mapped back onto `prob`.
     sol = solve(
         prob, SSRootfind(NewtonRaphson()); abstol = 1.0e-12, reltol = 1.0e-12
     )
     @test successful_retcode(sol)
     @test sol[states] ≈ expected atol = 1.0e-9
-    @test sol.prob isa SCCNonlinearProblem
+    @test sol.prob isa SteadyStateProblem
+    @test sol.original.prob isa SCCNonlinearProblem
 end
 
 @testset "DynamicSS on a SteadyStateProblem with an SCC lowering" begin
@@ -415,8 +417,10 @@ end
     sol = solve(prob, DynamicSS(); abstol = 1.0e-10, reltol = 1.0e-10)
     @test successful_retcode(sol)
     @test sol[[a, b, x]] ≈ [1, 2, cbrt(3)] atol = 1.0e-8
-    @test sol.prob isa SCCNonlinearProblem
-    @test sol.original isa Tuple{SciMLBase.LinearSolution, NonlinearSolution}
+    @test sol.prob isa SteadyStateProblem
+    @test length(sol.u) == length(prob.u0)
+    @test sol.original.prob isa SCCNonlinearProblem
+    @test sol.original.original isa Tuple{SciMLBase.LinearSolution, NonlinearSolution}
 end
 
 @testset "SICNM on a SteadyStateProblem with an SCC lowering" begin
@@ -432,8 +436,10 @@ end
     sol = solve(prob, SICNM(Rodas5P()); abstol = 1.0e-10, reltol = 1.0e-10)
     @test successful_retcode(sol)
     @test sol[[a, b, x]] ≈ [1, 2, cbrt(3)] atol = 1.0e-8
-    @test sol.prob isa SCCNonlinearProblem
-    @test sol.original isa Tuple{SciMLBase.LinearSolution, NonlinearSolution}
+    @test sol.prob isa SteadyStateProblem
+    @test length(sol.u) == length(prob.u0)
+    @test sol.original.prob isa SCCNonlinearProblem
+    @test sol.original.original isa Tuple{SciMLBase.LinearSolution, NonlinearSolution}
 end
 
 # `init` with `DynamicSS`/`SICNM` uses these algorithms rather than NonlinearSolve's
@@ -483,6 +489,44 @@ end
         sol = init(prob, alg; abstol = 1.0e-10, reltol = 1.0e-10)
         @test successful_retcode(sol)
         @test sol[[a, b, x]] ≈ [1, 2, cbrt(3)] atol = 1.0e-8
-        @test sol.prob isa SCCNonlinearProblem
+        @test sol.prob isa SteadyStateProblem
+        @test sol.original.prob isa SCCNonlinearProblem
+    end
+end
+
+# The SCC lowering is compiled from the residual system separately, so for a
+# system that was only `complete`d its state can be shorter than `prob.u0` (here
+# `mtkcompile` eliminates one of the two unknowns of the linear residual). The
+# solution is mapped back onto `prob`'s own state ordering.
+@testset "SCC-lowered solution is expressed in the problem's state, alg=$(nameof(typeof(alg)))" for alg in (
+        DynamicSS(Tsit5()), SICNM(Rodas5P()), SSRootfind(NewtonRaphson()),
+    )
+    @parameters kp kd k1 k2
+    @variables X(t) Y(t) XY(t)
+    osys = complete(
+        System(
+            [D(X) ~ kp - kd * X - k1 * X + k2 * Y, D(Y) ~ 1 + k1 * X - k2 * Y - Y], t;
+            observed = [XY ~ X + Y], name = :osys
+        )
+    )
+    p = [kp => 1.0, kd => 0.1, k1 => 0.25, k2 => 0.5]
+    prob = SteadyStateProblem(osys, [X => 4.0, Y => 5.0, p...])
+    @test length(SCCNonlinearProblem(prob).f.sys |> unknowns) < length(prob.u0)
+
+    # kp - kd X - k1 X + k2 Y = 0 and 1 + k1 X - k2 Y - Y = 0
+    Xss, Yss = [0.35 -0.5; -0.25 1.5] \ [1.0, 1.0]
+    sol = solve(prob, alg; abstol = 1.0e-10, reltol = 1.0e-10)
+    @test successful_retcode(sol)
+    @test sol.prob isa SteadyStateProblem
+    @test length(sol.u) == length(prob.u0)
+    uidxs = variable_index.((osys,), [X, Y])
+    @test sol.u[uidxs] ≈ [Xss, Yss] atol = 1.0e-8
+    @test getsym(osys, [X, Y])(sol) ≈ [Xss, Yss] atol = 1.0e-8
+    @test sol[XY] ≈ Xss + Yss atol = 1.0e-8
+    @test sol.resid ≈ zeros(2) atol = 1.0e-7
+
+    if !(alg isa SSRootfind)
+        sol = solve(prob, alg; abstol = 1.0e-10, reltol = 1.0e-10, save_idxs = uidxs[2:2])
+        @test sol.u ≈ [Yss] atol = 1.0e-8
     end
 end

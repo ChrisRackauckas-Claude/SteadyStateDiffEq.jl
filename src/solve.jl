@@ -18,15 +18,14 @@ function SciMLBase.__solve(
         fwd = (; (n => v for (n, v) in pairs(kwargs) if n !== :alias && n !== :verbose)...)
     end
     nlsol = solve(nlprob, alg.alg, args...; fwd...)
-    # A stored `lowered_problem` (e.g. an `SCCNonlinearProblem`) solves in the
-    # lowering's own state ordering, so its solution is expressed on the
-    # lowering rather than the steady-state problem.
-    solprob = if prob isa SteadyStateProblem && prob.lowered_problem !== nothing
-        nlprob
-    else
-        prob
+    if prob isa SteadyStateProblem && prob.lowered_problem !== nothing
+        sol = __scc_solution_on_problem(prob, SSRootfind(nlsol.alg), nlsol)
+        sol !== nothing && return sol
+        # Without symbolic information the lowering's state cannot be mapped
+        # back, so the solution is expressed on the lowering itself.
+        return __build_ssrootfind_solution(nlprob, nlsol)
     end
-    return __build_ssrootfind_solution(solprob, nlsol)
+    return __build_ssrootfind_solution(prob, nlsol)
 end
 
 # An SCCNonlinearProblem has no top-level `u0`/`kwargs` fields, so it cannot go
@@ -109,10 +108,37 @@ function __solve_scc_lowering(
     lp isa SciMLBase.AbstractSciMLProblem || (lp = lp(prob))
     lp isa SciMLBase.SCCNonlinearProblem || return nothing
     sccsol = solve(lp, alg, args...; kwargs...)
-    save_idxs === nothing && return sccsol
+    sol = __scc_solution_on_problem(prob, sccsol.alg, sccsol)
+    sol === nothing && (sol = sccsol)
+    save_idxs === nothing && return sol
     return SciMLBase.build_solution(
-        lp, sccsol.alg, sccsol.u[save_idxs], sccsol.resid[save_idxs];
-        retcode = sccsol.retcode, original = sccsol
+        sol.prob, sol.alg, sol.u[save_idxs], sol.resid[save_idxs];
+        retcode = sol.retcode, original = sol.original
+    )
+end
+
+# The SCC lowering of a symbolic `SteadyStateProblem` is built on a separately
+# compiled residual system, so its state generally differs from `prob`'s in
+# length and order. When `prob` is symbolic and the lowering's index provider
+# resolves every unknown of `prob`, the solution is mapped back onto `prob` so
+# that `sol.u` lines up with `prob.u0` and `sol` indexes like `prob`. Returns
+# `nothing` when no such mapping exists.
+function __scc_solution_on_problem(prob::SteadyStateProblem, alg, sccsol)
+    SciMLBase.has_sys(prob.f) && prob.f.sys !== nothing || return nothing
+    syms = variable_symbols(prob)
+    length(syms) == length(prob.u0) || return nothing
+    all(s -> is_variable(sccsol, s) || is_observed(sccsol, s), syms) || return nothing
+    u = getsym(sccsol, syms)(sccsol)
+    u = prob.u0 isa Array ? convert(Array, u) : oftype(prob.u0, u)
+    resid = if isinplace(prob)
+        du = similar(u)
+        prob.f(du, u, prob.p, Inf)
+        du
+    else
+        prob.f(u, prob.p, Inf)
+    end
+    return SciMLBase.build_solution(
+        prob, alg, u, resid; retcode = sccsol.retcode, original = sccsol
     )
 end
 
