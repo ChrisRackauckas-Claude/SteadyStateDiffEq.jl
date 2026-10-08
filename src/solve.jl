@@ -97,16 +97,21 @@ function SciMLBase.solve(
     return SciMLBase.build_solution(prob, alg, u, resid; retcode, original = sols)
 end
 
-# A `SteadyStateProblem` that records an `SCCNonlinearProblem` lowering is
-# solved block-sequentially in the lowering's ordering instead of one
-# monolithic integration. Returns `nothing` when there is no SCC lowering.
-function __solve_scc_lowering(
-        prob, alg, args...; save_idxs = nothing, kwargs...
-    )
+# The `SCCNonlinearProblem` lowering recorded on a `SteadyStateProblem`, or
+# `nothing` when there is none.
+function __scc_lowering(prob)
     lp = prob isa SteadyStateProblem ? prob.lowered_problem : nothing
     lp === nothing && return nothing
     lp isa SciMLBase.AbstractSciMLProblem || (lp = lp(prob))
-    lp isa SciMLBase.SCCNonlinearProblem || return nothing
+    return lp isa SciMLBase.SCCNonlinearProblem ? lp : nothing
+end
+
+# A `SteadyStateProblem` that records an `SCCNonlinearProblem` lowering `lp` is
+# solved block-sequentially in the lowering's ordering instead of one
+# monolithic integration.
+function __solve_scc_lowering(
+        prob, lp, alg, args...; save_idxs = nothing, kwargs...
+    )
     sccsol = solve(lp, alg, args...; kwargs...)
     sol = __scc_solution_on_problem(prob, sccsol.alg, sccsol)
     sol === nothing && (sol = sccsol)
@@ -174,6 +179,39 @@ function SciMLBase.solve(prob::SteadyStateProblem, args...; kwargs...)
         _prob, args...; kwargs...
     )
 end
+
+# `init(prob, ::DynamicSS/SICNM)` returns one of these caches; `solve!` finishes
+# it with the same steady-state finalization as `solve`.
+@concrete struct SteadyStateSCCCache
+    prob
+    lowered_problem
+    alg
+    args
+    kwargs
+end
+
+function SciMLBase.solve!(cache::SteadyStateSCCCache)
+    return __solve_scc_lowering(
+        cache.prob, cache.lowered_problem, cache.alg, cache.args...; cache.kwargs...
+    )
+end
+
+@concrete struct SteadyStateODECache
+    prob
+    alg
+    integrator
+    setup
+    save_idxs
+end
+
+function SciMLBase.solve!(cache::SteadyStateODECache)
+    odesol = solve!(cache.integrator)
+    return __steady_state_solution(
+        cache.prob, cache.alg, cache.setup, odesol, cache.save_idxs
+    )
+end
+
+SciMLBase.step!(cache::SteadyStateODECache, args...) = step!(cache.integrator, args...)
 
 __get_tspan(u0, alg::Union{DynamicSS, SICNM}) = __get_tspan(u0, alg.tspan)
 __get_tspan(u0, tspan::Tuple) = tspan
@@ -251,11 +289,11 @@ function SciMLBase.__solve(
         save_idxs = nothing, termination_condition = NonlinearSolveBase.NormTerminationMode(infnorm),
         alias = SciMLBase.NonlinearAliasSpecifier(), kwargs...
     )
-    sccsol = __solve_scc_lowering(
-        prob, alg, args...; abstol, reltol, odesolve_kwargs,
+    lp = __scc_lowering(prob)
+    lp !== nothing && return __solve_scc_lowering(
+        prob, lp, alg, args...; abstol, reltol, odesolve_kwargs,
         termination_condition, alias, save_idxs, kwargs...
     )
-    sccsol !== nothing && return sccsol
 
     setup = __dynamicss_ode_setup(
         prob, alg; abstol, reltol, odesolve_kwargs, termination_condition, alias, kwargs...
@@ -265,7 +303,10 @@ function SciMLBase.__solve(
         setup.run_kwargs..., odesolve_kwargs..., setup.callback, save_end = true,
         alias = setup.odealias
     )
+    return __steady_state_solution(prob, alg, setup, odesol, save_idxs)
+end
 
+function __steady_state_solution(prob, alg::DynamicSS, setup, odesol, save_idxs)
     resid, u, retcode = __get_result_from_sol(setup.tc_cache, odesol)
 
     if save_idxs !== nothing
@@ -279,29 +320,29 @@ function SciMLBase.__solve(
     )
 end
 
-# `init` returns the ODE integrator with the steady-state termination callback
-# installed. An SCC lowering solves its blocks sequentially with no single
-# integrator, so it is solved eagerly and the finished solution is returned.
 function SciMLBase.__init(
         prob::SciMLBase.AbstractSteadyStateProblem, alg::DynamicSS,
         args...; abstol = 1.0e-8, reltol = 1.0e-6, odesolve_kwargs = (;),
         save_idxs = nothing, termination_condition = NonlinearSolveBase.NormTerminationMode(infnorm),
         alias = SciMLBase.NonlinearAliasSpecifier(), kwargs...
     )
-    sccsol = __solve_scc_lowering(
-        prob, alg, args...; abstol, reltol, odesolve_kwargs,
-        termination_condition, alias, save_idxs, kwargs...
+    lp = __scc_lowering(prob)
+    lp !== nothing && return SteadyStateSCCCache(
+        prob, lp, alg, args, (;
+            abstol, reltol, odesolve_kwargs, termination_condition, alias,
+            save_idxs, kwargs...,
+        )
     )
-    sccsol !== nothing && return sccsol
 
     setup = __dynamicss_ode_setup(
         prob, alg; abstol, reltol, odesolve_kwargs, termination_condition, alias, kwargs...
     )
-    return init(
+    integrator = init(
         setup.odeprob, alg.alg, args...; setup.abstol, setup.reltol,
         setup.run_kwargs..., odesolve_kwargs..., setup.callback, save_end = true,
-        alias = setup.odealias, save_idxs
+        alias = setup.odealias
     )
+    return SteadyStateODECache(prob, alg, integrator, setup, save_idxs)
 end
 
 # SICNM: Semi-Implicit Continuous Newton Method
@@ -456,11 +497,11 @@ function SciMLBase.__solve(
         termination_condition = NonlinearSolveBase.AbsNormTerminationMode(infnorm),
         alias = SciMLBase.NonlinearAliasSpecifier(), kwargs...
     )
-    sccsol = __solve_scc_lowering(
-        prob, alg, args...; abstol, reltol, odesolve_kwargs,
+    lp = __scc_lowering(prob)
+    lp !== nothing && return __solve_scc_lowering(
+        prob, lp, alg, args...; abstol, reltol, odesolve_kwargs,
         termination_condition, alias, save_idxs, kwargs...
     )
-    sccsol !== nothing && return sccsol
 
     setup = __sicnm_ode_setup(
         prob, alg; abstol, reltol, odesolve_kwargs, termination_condition, kwargs...
@@ -470,7 +511,10 @@ function SciMLBase.__solve(
         reltol = setup.ode_reltol, setup.run_kwargs..., odesolve_kwargs...,
         setup.callback, save_end = true
     )
+    return __steady_state_solution(prob, alg, setup, odesol, save_idxs)
+end
 
+function __steady_state_solution(prob, alg::SICNM, setup, odesol, save_idxs)
     u, retcode = __sicnm_result(setup.tc_cache, odesol, setup.n)
     resid = if setup.iip
         setup.g(setup.gbuf, u)
@@ -490,7 +534,6 @@ function SciMLBase.__solve(
     )
 end
 
-# As for `DynamicSS`, an SCC lowering is solved eagerly.
 function SciMLBase.__init(
         prob::SciMLBase.AbstractSteadyStateProblem, alg::SICNM,
         args...; abstol = 1.0e-8, reltol = 1.0e-6, odesolve_kwargs = (;),
@@ -498,20 +541,23 @@ function SciMLBase.__init(
         termination_condition = NonlinearSolveBase.AbsNormTerminationMode(infnorm),
         alias = SciMLBase.NonlinearAliasSpecifier(), kwargs...
     )
-    sccsol = __solve_scc_lowering(
-        prob, alg, args...; abstol, reltol, odesolve_kwargs,
-        termination_condition, alias, save_idxs, kwargs...
+    lp = __scc_lowering(prob)
+    lp !== nothing && return SteadyStateSCCCache(
+        prob, lp, alg, args, (;
+            abstol, reltol, odesolve_kwargs, termination_condition, alias,
+            save_idxs, kwargs...,
+        )
     )
-    sccsol !== nothing && return sccsol
 
     setup = __sicnm_ode_setup(
         prob, alg; abstol, reltol, odesolve_kwargs, termination_condition, kwargs...
     )
-    return init(
+    integrator = init(
         setup.odeprob, alg.alg, args...; abstol = setup.ode_abstol,
         reltol = setup.ode_reltol, setup.run_kwargs..., odesolve_kwargs...,
-        setup.callback, save_end = true, save_idxs
+        setup.callback, save_end = true
     )
+    return SteadyStateODECache(prob, alg, integrator, setup, save_idxs)
 end
 
 function __sicnm_result(tc_cache, odesol, n)
