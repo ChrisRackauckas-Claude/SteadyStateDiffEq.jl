@@ -118,7 +118,7 @@ function __solve_scc_lowering(
     save_idxs === nothing && return sol
     return SciMLBase.build_solution(
         sol.prob, sol.alg, sol.u[save_idxs], sol.resid[save_idxs];
-        retcode = sol.retcode, original = sol.original
+        retcode = sol.retcode, sol.stats, original = sol
     )
 end
 
@@ -134,7 +134,7 @@ function __scc_solution_on_problem(prob::SteadyStateProblem, alg, sccsol)
     length(syms) == length(prob.u0) || return nothing
     all(s -> is_variable(sccsol, s) || is_observed(sccsol, s), syms) || return nothing
     u = getsym(sccsol, syms)(sccsol)
-    u = prob.u0 isa Array ? convert(Array, u) : oftype(prob.u0, u)
+    u = convert(typeof(prob.u0), collect(u))
     resid = if isinplace(prob)
         du = similar(u)
         prob.f(du, u, prob.p, Inf)
@@ -143,7 +143,8 @@ function __scc_solution_on_problem(prob::SteadyStateProblem, alg, sccsol)
         prob.f(u, prob.p, Inf)
     end
     return SciMLBase.build_solution(
-        prob, alg, u, resid; retcode = sccsol.retcode, original = sccsol
+        prob, alg, u, resid; sccsol.retcode, sccsol.stats, sccsol.left,
+        sccsol.right, original = sccsol
     )
 end
 

@@ -585,3 +585,76 @@ end
         @test sol.u[uidxs] ≈ [Xss, Yss] atol = 1.0e-8
     end
 end
+
+@testset "SCC-lowered solution metadata" begin
+    # The lowering solves `x` to an integer literal, so it is observed with an
+    # `Int` value; the mapped state must keep `prob.u0`'s type.
+    @variables x(t)
+    csys = complete(System([D(x) ~ 1 - x], t; name = :csys))
+    prob = SteadyStateProblem(csys, [x => 0.2])
+    @testset "eltype, alg=$(nameof(typeof(alg)))" for alg in (
+            SSRootfind(NewtonRaphson()), DynamicSS(Tsit5()), SICNM(Rodas5P()),
+        )
+        sol = solve(prob, alg; abstol = 1.0e-10, reltol = 1.0e-10)
+        @test sol.prob isa SteadyStateProblem
+        @test sol.u isa typeof(prob.u0)
+        @test sol.resid isa typeof(prob.u0)
+        @test sol.u ≈ [1.0]
+    end
+
+    # Lotka–Volterra lowers to a plain `NonlinearProblem` whose unknowns are in
+    # a different order than the problem's.
+    @parameters α = 1.5 β = 1.0 γ = 3.0 δ = 1.0
+    @variables u(t) v(t)
+    lv = mtkcompile(
+        System([D(u) ~ α * u - β * u * v, D(v) ~ -γ * v + δ * u * v], t; name = :lv)
+    )
+    lvprob = SteadyStateProblem(lv, [u => 2.9, v => 1.6])
+    sol = solve(lvprob, SSRootfind(NewtonRaphson()); abstol = 1.0e-12, reltol = 1.0e-12)
+    @test sol.prob isa SteadyStateProblem
+    @test sol[[u, v]] ≈ [3.0, 1.5] atol = 1.0e-8
+    @test sol.stats !== nothing
+    @test sol.stats === sol.original.stats
+    @test sol.left === sol.original.left
+    @test sol.right === sol.original.right
+
+    @testset "save_idxs keeps the unsliced solution as original" begin
+        sccprob = SCCNonlinearProblem(
+            (
+                NonlinearProblem((u, p) -> [1.0 - u[1]], [0.0]),
+                NonlinearProblem((u, p) -> [2.0 - u[1]], [0.0]),
+            ),
+            (Returns(nothing), Returns(nothing))
+        )
+        manual = SteadyStateProblem(
+            (u, p, t) -> 1 .- u, [0.0, 0.0]; lowered_problem = sccprob
+        )
+        sliced = solve(
+            manual, DynamicSS(Tsit5()); save_idxs = [2], abstol = 1.0e-10, reltol = 1.0e-10
+        )
+        @test sliced.u ≈ [2.0] atol = 1.0e-8
+        @test sliced.original.prob === sccprob
+        @test sliced.original.u ≈ [1.0, 2.0] atol = 1.0e-8
+
+        @parameters kp kd k1 k2
+        @variables X(t) Y(t)
+        osys = complete(
+            System(
+                [D(X) ~ kp - kd * X - k1 * X + k2 * Y, D(Y) ~ 1 + k1 * X - k2 * Y - Y], t;
+                name = :osys2
+            )
+        )
+        sprob = SteadyStateProblem(
+            osys, [X => 4.0, Y => 5.0, kp => 1.0, kd => 0.1, k1 => 0.25, k2 => 0.5]
+        )
+        Xss, Yss = [0.35 -0.5; -0.25 1.5] \ [1.0, 1.0]
+        uidxs = variable_index.((osys,), [X, Y])
+        sliced = solve(
+            sprob, DynamicSS(Tsit5()); save_idxs = uidxs[2:2],
+            abstol = 1.0e-10, reltol = 1.0e-10
+        )
+        @test sliced.u ≈ [Yss] atol = 1.0e-8
+        @test sliced.original.prob isa SteadyStateProblem
+        @test sliced.original.u[uidxs] ≈ [Xss, Yss] atol = 1.0e-8
+    end
+end
