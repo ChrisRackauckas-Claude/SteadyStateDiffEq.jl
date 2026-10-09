@@ -592,8 +592,10 @@ end
     @variables x(t)
     csys = complete(System([D(x) ~ 1 - x], t; name = :csys))
     prob = SteadyStateProblem(csys, [x => 0.2])
+    # `Broyden` needs no Jacobian, which the oldest supported NonlinearSolve
+    # stack cannot form for the zero-length lowering.
     @testset "eltype, alg=$(nameof(typeof(alg)))" for alg in (
-            SSRootfind(NewtonRaphson()), DynamicSS(Tsit5()), SICNM(Rodas5P()),
+            SSRootfind(Broyden()), DynamicSS(Tsit5()), SICNM(Rodas5P()),
         )
         sol = solve(prob, alg; abstol = 1.0e-10, reltol = 1.0e-10)
         @test sol.prob isa SteadyStateProblem
